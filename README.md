@@ -42,6 +42,23 @@ Then use pi's built-in `/model` command to select an account. Slot models are la
 
 Use pi's built-in `/logout` command to remove a slot's credentials.
 
+### Usage checks
+
+Run this command to fetch rate-limit usage for the account behind the currently selected Codex provider:
+
+```text
+/codex-usage
+```
+
+The result appears as a single-line compact widget. It shows only the Codex slot name followed by each session or weekly window; account identifiers are omitted. Every window uses a color-highlighted remaining-quota bar with only the percentage left on the right. Model-specific limits are selected when the API exposes one for the active model.
+
+The extension also checks automatically:
+
+- when a session opens (startup, new, resumed, or forked sessions)
+- after the agent fully settles on its final turn
+
+Automatic checks are limited to once every five minutes per provider. Manual `/codex-usage` checks bypass that cooldown. Usage credentials are resolved through pi's active provider, so each slot checks its own logged-in account.
+
 ## Configuration
 
 Set `PI_CODEX_NUM_PROVIDER` to create between 1 and 100 slots (default: `3`):

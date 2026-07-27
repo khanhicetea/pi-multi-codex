@@ -1,9 +1,146 @@
 import type { Provider } from "@earendil-works/pi-ai";
 import { builtinProviders } from "@earendil-works/pi-ai/providers/all";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  CODEX_PROVIDER_PREFIX,
+  codexUsageRows,
+  fetchCodexUsage,
+  formatCodexUsage,
+  formatPercent,
+  isCodexProvider,
+  type CodexUsageReport,
+} from "./usage.js";
 
-const PROVIDER_PREFIX = "openai-codex-";
+const PROVIDER_PREFIX = CODEX_PROVIDER_PREFIX;
 const DEFAULT_SLOTS = 3;
+const AUTO_USAGE_INTERVAL_MS = 5 * 60 * 1000;
+const SHARED_USAGE_STATE_KEY = "__piMultiCodexUsageStateV2";
+const USAGE_WIDGET_ID = "multi-codex-usage";
+
+interface SharedUsageState {
+  lastCheckAt: Map<string, number>;
+  pending: Map<string, Promise<CodexUsageReport>>;
+  reports: Map<string, CodexUsageReport>;
+}
+
+function sharedUsageState(): SharedUsageState {
+  const globalRecord = globalThis as unknown as Record<string, unknown>;
+  const existing = globalRecord[SHARED_USAGE_STATE_KEY] as SharedUsageState | undefined;
+  if (existing) return existing;
+
+  const state: SharedUsageState = {
+    lastCheckAt: new Map(),
+    pending: new Map(),
+    reports: new Map(),
+  };
+  globalRecord[SHARED_USAGE_STATE_KEY] = state;
+  return state;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function truncatePlain(text: string, width: number): string {
+  if (width <= 0) return "";
+  const characters = Array.from(text);
+  if (characters.length <= width) return text;
+  if (width === 1) return "…";
+  return `${characters.slice(0, width - 1).join("")}…`;
+}
+
+function usageColor(leftPercent: number | null, limited: boolean): "success" | "warning" | "error" {
+  if (limited || leftPercent === null || leftPercent <= 20) return "error";
+  if (leftPercent <= 50) return "warning";
+  return "success";
+}
+
+function renderUsage(ctx: ExtensionContext, report: CodexUsageReport): void {
+  if (ctx.mode !== "tui") {
+    ctx.ui.notify(formatCodexUsage(report), "info");
+    return;
+  }
+
+  const provider = report.providerName.replace(/^OpenAI\s+/i, "");
+  const rows = codexUsageRows(report).map((row) => ({
+    ...row,
+    percent: row.leftPercent === null ? "--%" : `${formatPercent(row.leftPercent)}%`,
+  }));
+  const separator = " - ";
+
+  ctx.ui.setWidget(USAGE_WIDGET_ID, (_tui, theme) => ({
+    render(width: number): string[] {
+      if (width <= 0) return [];
+
+      const fixedWidth = provider.length
+        + separator.length * rows.length
+        + rows.reduce((total, row) => total + row.label.length + row.percent.length + 2, 0);
+      const barWidth = Math.min(10, Math.floor((width - fixedWidth) / rows.length));
+
+      if (barWidth >= 3) {
+        const windows = rows.map((row) => {
+          const color = usageColor(row.leftPercent, report.limited);
+          const filled = row.leftPercent === null ? 0 : Math.round(barWidth * row.leftPercent / 100);
+          const bar = theme.fg(color, "█".repeat(filled)) + theme.fg("dim", "░".repeat(barWidth - filled));
+          return `${theme.fg("muted", row.label)} ${bar} ${theme.fg(color, theme.bold(row.percent))}`;
+        });
+        return [[theme.fg("accent", theme.bold(provider)), ...windows].join(separator)];
+      }
+
+      const compactWindowsWidth = separator.length * rows.length
+        + rows.reduce((total, row) => total + row.label.length + row.percent.length + 1, 0);
+      const providerWidth = width - compactWindowsWidth;
+      if (providerWidth > 0) {
+        const windows = rows.map((row) => {
+          const color = usageColor(row.leftPercent, report.limited);
+          return `${theme.fg("muted", row.label)} ${theme.fg(color, theme.bold(row.percent))}`;
+        });
+        const compactProvider = truncatePlain(provider, providerWidth);
+        return [[theme.fg("accent", theme.bold(compactProvider)), ...windows].join(separator)];
+      }
+
+      const fallback = [provider, ...rows.map((row) => `${row.label} ${row.percent}`)].join(separator);
+      return [theme.fg("accent", truncatePlain(fallback, width))];
+    },
+    invalidate() {},
+  }));
+}
+
+async function showCurrentUsage(ctx: ExtensionContext, manual: boolean): Promise<void> {
+  const providerId = ctx.model?.provider;
+  if (!isCodexProvider(providerId)) {
+    if (ctx.hasUI) ctx.ui.setWidget(USAGE_WIDGET_ID, undefined);
+    if (manual) ctx.ui.notify("Select an OpenAI Codex model first", "warning");
+    return;
+  }
+  if (!manual && !ctx.hasUI) return;
+
+  const state = sharedUsageState();
+  const cached = state.reports.get(providerId);
+  if (!manual && cached && ctx.mode === "tui") renderUsage(ctx, cached);
+
+  const now = Date.now();
+  const lastCheck = state.lastCheckAt.get(providerId) ?? 0;
+  if (!manual && now - lastCheck < AUTO_USAGE_INTERVAL_MS) return;
+
+  let request = state.pending.get(providerId);
+  if (!request) {
+    state.lastCheckAt.set(providerId, now);
+    request = fetchCodexUsage(ctx, ctx.signal);
+    state.pending.set(providerId, request);
+    void request.finally(() => {
+      if (state.pending.get(providerId) === request) state.pending.delete(providerId);
+    }).catch(() => undefined);
+  }
+
+  try {
+    const report = await request;
+    state.reports.set(providerId, report);
+    renderUsage(ctx, report);
+  } catch (error) {
+    ctx.ui.notify(`Codex usage check failed: ${errorMessage(error)}`, manual ? "error" : "warning");
+  }
+}
 
 function slotCount(): number {
   const value = process.env.PI_CODEX_NUM_PROVIDER?.trim() || String(DEFAULT_SLOTS);
@@ -40,4 +177,23 @@ export default function multiCodex(pi: ExtensionAPI) {
   for (let slot = 1; slot <= slotCount(); slot++) {
     pi.registerProvider(createSlotProvider(source, slot));
   }
+
+  pi.registerCommand("codex-usage", {
+    description: "Check usage for the currently selected Codex account",
+    handler: async (_args, ctx) => {
+      await showCurrentUsage(ctx, true);
+    },
+  });
+
+  pi.on("session_start", async (event, ctx) => {
+    if (event.reason !== "reload") await showCurrentUsage(ctx, false);
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    await showCurrentUsage(ctx, false);
+  });
+
+  pi.on("model_select", async (_event, ctx) => {
+    await showCurrentUsage(ctx, false);
+  });
 }
