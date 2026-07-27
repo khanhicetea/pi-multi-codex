@@ -14,7 +14,7 @@ import {
 const PROVIDER_PREFIX = CODEX_PROVIDER_PREFIX;
 const DEFAULT_SLOTS = 3;
 const AUTO_USAGE_INTERVAL_MS = 5 * 60 * 1000;
-const SHARED_USAGE_STATE_KEY = "__piMultiCodexUsageStateV2";
+const SHARED_USAGE_STATE_KEY = "__piMultiCodexUsageStateV3";
 const USAGE_WIDGET_ID = "multi-codex-usage";
 
 interface SharedUsageState {
@@ -55,6 +55,14 @@ function usageColor(leftPercent: number | null, limited: boolean): "success" | "
   return "success";
 }
 
+function hasLowUsage(report: CodexUsageReport): boolean {
+  return codexUsageRows(report).some((row) => row.leftPercent !== null && row.leftPercent < 20);
+}
+
+function clearUsage(ctx: ExtensionContext): void {
+  if (ctx.hasUI) ctx.ui.setWidget(USAGE_WIDGET_ID, undefined);
+}
+
 function renderUsage(ctx: ExtensionContext, report: CodexUsageReport): void {
   if (ctx.mode !== "tui") {
     ctx.ui.notify(formatCodexUsage(report), "info");
@@ -84,7 +92,9 @@ function renderUsage(ctx: ExtensionContext, report: CodexUsageReport): void {
           const bar = theme.fg(color, "█".repeat(filled)) + theme.fg("dim", "░".repeat(barWidth - filled));
           return `${theme.fg("muted", row.label)} ${bar} ${theme.fg(color, theme.bold(row.percent))}`;
         });
-        return [[theme.fg("accent", theme.bold(provider)), ...windows].join(separator)];
+        const content = [theme.fg("accent", theme.bold(provider)), ...windows].join(separator);
+        const contentWidth = fixedWidth + barWidth * rows.length;
+        return [`${" ".repeat(Math.max(0, width - contentWidth))}${content}`];
       }
 
       const compactWindowsWidth = separator.length * rows.length
@@ -96,50 +106,90 @@ function renderUsage(ctx: ExtensionContext, report: CodexUsageReport): void {
           return `${theme.fg("muted", row.label)} ${theme.fg(color, theme.bold(row.percent))}`;
         });
         const compactProvider = truncatePlain(provider, providerWidth);
-        return [[theme.fg("accent", theme.bold(compactProvider)), ...windows].join(separator)];
+        const content = [theme.fg("accent", theme.bold(compactProvider)), ...windows].join(separator);
+        const contentWidth = Array.from(compactProvider).length + compactWindowsWidth;
+        return [`${" ".repeat(Math.max(0, width - contentWidth))}${content}`];
       }
 
-      const fallback = [provider, ...rows.map((row) => `${row.label} ${row.percent}`)].join(separator);
-      return [theme.fg("accent", truncatePlain(fallback, width))];
+      const fallback = truncatePlain(
+        [provider, ...rows.map((row) => `${row.label} ${row.percent}`)].join(separator),
+        width,
+      );
+      return [`${" ".repeat(Math.max(0, width - Array.from(fallback).length))}${theme.fg("accent", fallback)}`];
     },
     invalidate() {},
-  }));
+  }), { placement: "belowEditor" });
+}
+
+function updateUsageDisplay(ctx: ExtensionContext, report: CodexUsageReport, manual: boolean): void {
+  if (manual || hasLowUsage(report)) renderUsage(ctx, report);
+  else clearUsage(ctx);
+}
+
+function currentUsageKey(ctx: ExtensionContext): string | undefined {
+  const model = ctx.model;
+  return model && isCodexProvider(model.provider) ? `${model.provider}\0${model.id}` : undefined;
+}
+
+function isCurrentUsageKey(ctx: ExtensionContext, usageKey: string): boolean {
+  try {
+    return currentUsageKey(ctx) === usageKey;
+  } catch {
+    return false;
+  }
+}
+
+function safeNotify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error"): void {
+  try {
+    ctx.ui.notify(message, type);
+  } catch {
+    // The async check may finish after its session has been replaced.
+  }
 }
 
 async function showCurrentUsage(ctx: ExtensionContext, manual: boolean): Promise<void> {
-  const providerId = ctx.model?.provider;
-  if (!isCodexProvider(providerId)) {
-    if (ctx.hasUI) ctx.ui.setWidget(USAGE_WIDGET_ID, undefined);
-    if (manual) ctx.ui.notify("Select an OpenAI Codex model first", "warning");
+  const usageKey = currentUsageKey(ctx);
+  if (!usageKey) {
+    clearUsage(ctx);
+    if (manual) safeNotify(ctx, "Select an OpenAI Codex model first", "warning");
     return;
   }
   if (!manual && !ctx.hasUI) return;
 
   const state = sharedUsageState();
-  const cached = state.reports.get(providerId);
-  if (!manual && cached && ctx.mode === "tui") renderUsage(ctx, cached);
+  const cached = state.reports.get(usageKey);
+  if (!manual && ctx.mode === "tui") {
+    if (cached) updateUsageDisplay(ctx, cached, false);
+    else clearUsage(ctx);
+  }
 
   const now = Date.now();
-  const lastCheck = state.lastCheckAt.get(providerId) ?? 0;
+  const lastCheck = state.lastCheckAt.get(usageKey) ?? 0;
   if (!manual && now - lastCheck < AUTO_USAGE_INTERVAL_MS) return;
 
-  let request = state.pending.get(providerId);
+  let request = state.pending.get(usageKey);
   if (!request) {
-    state.lastCheckAt.set(providerId, now);
+    state.lastCheckAt.set(usageKey, now);
     request = fetchCodexUsage(ctx, ctx.signal);
-    state.pending.set(providerId, request);
+    state.pending.set(usageKey, request);
     void request.finally(() => {
-      if (state.pending.get(providerId) === request) state.pending.delete(providerId);
+      if (state.pending.get(usageKey) === request) state.pending.delete(usageKey);
     }).catch(() => undefined);
   }
 
   try {
     const report = await request;
-    state.reports.set(providerId, report);
-    renderUsage(ctx, report);
+    state.reports.set(usageKey, report);
+    if (isCurrentUsageKey(ctx, usageKey)) updateUsageDisplay(ctx, report, manual);
   } catch (error) {
-    ctx.ui.notify(`Codex usage check failed: ${errorMessage(error)}`, manual ? "error" : "warning");
+    if (manual && isCurrentUsageKey(ctx, usageKey)) {
+      safeNotify(ctx, `Codex usage check failed: ${errorMessage(error)}`, "error");
+    }
   }
+}
+
+function checkUsageInBackground(ctx: ExtensionContext): void {
+  void showCurrentUsage(ctx, false).catch(() => undefined);
 }
 
 function slotCount(): number {
@@ -185,15 +235,15 @@ export default function multiCodex(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", async (event, ctx) => {
-    if (event.reason !== "reload") await showCurrentUsage(ctx, false);
+  pi.on("session_start", (_event, ctx) => {
+    clearUsage(ctx);
   });
 
-  pi.on("agent_settled", async (_event, ctx) => {
-    await showCurrentUsage(ctx, false);
+  pi.on("agent_settled", (_event, ctx) => {
+    checkUsageInBackground(ctx);
   });
 
-  pi.on("model_select", async (_event, ctx) => {
-    await showCurrentUsage(ctx, false);
+  pi.on("model_select", (_event, ctx) => {
+    clearUsage(ctx);
   });
 }

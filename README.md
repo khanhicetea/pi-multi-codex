@@ -50,14 +50,14 @@ Run this command to fetch rate-limit usage for the account behind the currently 
 /codex-usage
 ```
 
-The result appears as a single-line compact widget. It shows only the Codex slot name followed by each session or weekly window; account identifiers are omitted. Every window uses a color-highlighted remaining-quota bar with only the percentage left on the right. Model-specific limits are selected when the API exposes one for the active model.
+The result appears as a single-line compact widget, right-aligned below the editor beside the footer. It shows only the Codex slot name followed by each session or weekly window; account identifiers are omitted. Every window uses a color-highlighted remaining-quota bar with only the percentage left on the right. Model-specific limits are selected when the API exposes one for the active model.
 
-The extension also checks automatically:
+The widget is displayed only when:
 
-- when a session opens (startup, new, resumed, or forked sessions)
-- after the agent fully settles on its final turn
+- `/codex-usage` is run manually, regardless of the remaining quota
+- a background check after the agent's final settled turn finds any usage window below 20% remaining
 
-Automatic checks are limited to once every five minutes per provider. Manual `/codex-usage` checks bypass that cooldown. Usage credentials are resolved through pi's active provider, so each slot checks its own logged-in account.
+Automatic checks are limited to once every five minutes per provider/model. Opening a session and switching models do not call the usage API and clear any previous widget. Automatic request failures stay silent; manual failures are reported. Usage credentials are resolved through pi's active provider, so each slot checks its own logged-in account.
 
 ## Configuration
 
